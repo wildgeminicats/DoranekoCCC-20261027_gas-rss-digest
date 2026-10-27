@@ -1,0 +1,12 @@
+{
+  "name": "gas-rss-digest",
+  "version": "1.1.3",
+  "private": true,
+  "description": "Development tests only; Apps Script runs Code.gs without npm.",
+  "scripts": {
+    "test": "node --test tests/*.test.cjs"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}
