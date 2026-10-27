@@ -1,6 +1,6 @@
 /** RSS Digest for Google Apps Script. No Node.js/npm dependency in GAS. */
 var DIGEST = Object.freeze({
-  version: '1.1.3', timezone: 'Asia/Tokyo', budgetMs: 240000,
+  version: '1.1.5', timezone: 'Asia/Tokyo', budgetMs: 240000,
   // Time kept free after summarization for sheet writes and the send itself.
   sendReserveMs: 30000,
   states: ['PREVIEW', 'PREPARED', 'SENDING', 'UNKNOWN', 'SENT', 'CANCELLED'],
@@ -16,6 +16,7 @@ var DIGEST = Object.freeze({
 // 1-based columns of the mail history sheet that the code reads or updates.
 var MAIL_COL = Object.freeze({ sentAt: 3, status: 9, detail: 10, keys: 11 });
 var NOTICE_COL = Object.freeze({ sentAt: 3, status: 8 });
+var URLFETCH_QUOTA_MESSAGE = 'URLFETCH_DAILY_QUOTA（Googleアカウント全体の1日のURL取得回数の上限に達しました。上限は24時間以内に回復します。時間をおいて再実行してください。同じアカウントの他のスクリプトも回数を消費します）';
 var NOTICE_SHEET_MISSING = '通知履歴シートがないため停止通知を送れません。setupSheetsを実行してください。';
 var DEFAULT_SETTINGS = [
   ['送信先', '', '本人のメールアドレス1件。最初に設定してください'],
@@ -110,23 +111,18 @@ function executeDigest_(send, opts) {
       cfg.feeds.forEach(function (feed) {
         checkBudget_(deadline);
         try {
-          var response = UrlFetchApp.fetch(feed.url, { muteHttpExceptions: true, followRedirects: true });
-          if (response.getResponseCode() !== 200) throw publicDigestError_('RSS_HTTP_' + response.getResponseCode());
-          var bytes = response.getContent();
-          if (bytes.length > 2000000) throw publicDigestError_('RSS_TOO_LARGE');
-          var xml = decodeDigestFeed_(bytes, headerValue_(response.getHeaders(), 'Content-Type'));
-          var parsed = parseDigestFeed_(xml, feed.name);
+          var parsed = fetchDigestFeed_(feed);
           items = items.concat(parsed.sort(compareArticles_).slice(0, feed.limit));
         } catch (error) {
-          if (error.digestBudget) throw error;
-          // Never persist provider bodies, source URL query strings, or raw exceptions.
+          if (error.digestBudget || error.digestQuota) throw error;
+          // Only our own classified reason is kept: never provider bodies, URLs or raw exceptions.
           feedFailures++;
-          warnings.push('RSS設定の行' + feed.row + ': 取得または解析に失敗');
+          warnings.push('RSS設定の行' + feed.row + ': ' + feedFailureReason_(error));
         }
       });
       var selected = selectDigestItems_(items, seen, cfg.maxItems);
       if (!selected.length) {
-        if (feedFailures === cfg.feeds.length) throw publicDigestError_('全RSSの取得に失敗しました。');
+        if (feedFailures === cfg.feeds.length) throw publicDigestError_('全RSSの取得に失敗しました。' + warnings.join(' / ') + '（原因の確認はdiagnoseFeedsを実行）');
         logDigestRun_(ss, runId, send ? '新着なし' : 'プレビュー新着なし', warnings.join(' / '));
         return { status: 'NO_NEW_ITEMS', warnings: warnings };
       }
@@ -375,24 +371,101 @@ function headerValue_(headers, name) {
  * Decodes feed bytes. Priority: BOM > HTTP charset > XML declaration > UTF-8.
  * The XML declaration is reduced to its version because the text is already decoded.
  */
-function decodeDigestFeed_(bytes, contentType) {
+/**
+ * Fetches and parses one feed. Each stage throws a classified public error, so a
+ * failure can be reported without storing the response body or the raw exception.
+ */
+function fetchDigestFeed_(feed) {
+  var response;
+  try {
+    response = UrlFetchApp.fetch(feed.url, { muteHttpExceptions: true, followRedirects: true });
+  } catch (error) {
+    if (isUrlFetchQuotaError_(error)) throw urlFetchQuotaError_();
+    throw publicDigestError_('RSS_NETWORK_ERROR（接続できません）');
+  }
+  var code = response.getResponseCode();
+  if (code !== 200) throw publicDigestError_('RSS_HTTP_' + code + (code === 403 ? '（取得先がアクセスを拒否）' : code === 404 ? '（URLが見つからない）' : ''));
+  var bytes = response.getContent();
+  if (bytes.length > 2000000) throw publicDigestError_('RSS_TOO_LARGE（2MB超）');
+  var xml;
+  try { xml = decodeDigestFeed_(bytes, headerValue_(response.getHeaders(), 'Content-Type')); }
+  catch (ignored) { throw publicDigestError_('RSS_DECODE_ERROR（文字コードを読めません）'); }
+  if (/^<!doctype html|^<html/i.test(xml)) throw publicDigestError_('RSS_NOT_FEED（RSSではなくWebページが返りました）');
+  var root;
+  try { root = XmlService.parse(xml).getRootElement(); }
+  catch (ignored) { throw publicDigestError_('RSS_XML_ERROR（XMLとして読めません）'); }
+  return parseDigestRoot_(root, feed.name);
+}
+/** Apps Script's own message when the per-account daily UrlFetchApp quota is used up. */
+function isUrlFetchQuotaError_(error) {
+  var m = String(error && error.message || error || '');
+  return /urlfetch/i.test(m) && /(too many times|回数が多すぎ|bandwidth|帯域)/i.test(m);
+}
+function urlFetchQuotaError_() {
+  var e = publicDigestError_(URLFETCH_QUOTA_MESSAGE);
+  e.digestQuota = true;
+  return e;
+}
+function feedFailureReason_(error) {
+  return error && error.digestPublic ? error.message : '取得または解析に失敗';
+}
+
+/**
+ * Diagnostic only: fetches each enabled feed and writes the result to the execution log.
+ * No Gemini call, no mail, no sheet writes. Response bodies are not logged.
+ */
+function diagnoseFeeds() {
+  return withDigestLock_(function () {
+    var cfg = loadDigestConfig_(openDigestBook_());
+    var results = cfg.feeds.map(function (feed) {
+      var line = { row: feed.row, name: feed.name, host: String(feed.url).replace(/^https?:\/\/([^\/?#]+).*$/i, '$1') };
+      try {
+        var response = UrlFetchApp.fetch(feed.url, { muteHttpExceptions: true, followRedirects: true });
+        var bytes = response.getContent(), contentType = headerValue_(response.getHeaders(), 'Content-Type');
+        line.http = response.getResponseCode();
+        line.contentType = contentType.slice(0, 80);
+        line.bytes = bytes.length;
+        if (line.http === 200) {
+          var xml = decodeDigestFeed_(bytes, contentType);
+          line.charset = detectFeedCharset_(bytes, contentType) || 'UTF-8（既定）';
+          line.head = xml.slice(0, 80).replace(/\s+/g, ' ');
+          var root = XmlService.parse(xml).getRootElement();
+          line.root = root.getName();
+          var items = parseDigestRoot_(root, feed.name);
+          line.items = items.length;
+          line.withExcerpt = items.filter(function (a) { return a.content; }).length;
+          line.result = items.length ? 'OK' : '記事0件（リンクが取れない形式の可能性）';
+        } else {
+          line.result = 'NG: RSS_HTTP_' + line.http;
+        }
+      } catch (error) {
+        line.result = 'NG: ' + (isUrlFetchQuotaError_(error) ? URLFETCH_QUOTA_MESSAGE :
+          error && error.digestPublic ? error.message : String(error && error.message || error).slice(0, 160));
+      }
+      Logger.log(JSON.stringify(line));
+      return line;
+    });
+    return results;
+  });
+}
+
+/** Charset decision: BOM > HTTP charset > XML declaration (empty string = default UTF-8). */
+function detectFeedCharset_(bytes, contentType) {
   var b = function (i) { return bytes[i] & 0xff; };
-  var charset = '';
-  if (bytes.length >= 3 && b(0) === 0xef && b(1) === 0xbb && b(2) === 0xbf) charset = 'UTF-8';
-  else if (bytes.length >= 2 && b(0) === 0xfe && b(1) === 0xff) charset = 'UTF-16BE';
-  else if (bytes.length >= 2 && b(0) === 0xff && b(1) === 0xfe) charset = 'UTF-16LE';
-  if (!charset) {
-    var m = /charset\s*=\s*["']?([A-Za-z0-9._:-]+)/i.exec(contentType || '');
-    if (m) charset = m[1];
-  }
-  if (!charset) {
-    var head = '';
-    for (var i = 0; i < Math.min(bytes.length, 256); i++) head += b(i) < 128 ? String.fromCharCode(b(i)) : '?';
-    var d = /^\s*<\?xml[^>]*encoding\s*=\s*["']([A-Za-z0-9._:-]+)["']/i.exec(head);
-    if (d) charset = d[1];
-  }
+  if (bytes.length >= 3 && b(0) === 0xef && b(1) === 0xbb && b(2) === 0xbf) return 'UTF-8';
+  if (bytes.length >= 2 && b(0) === 0xfe && b(1) === 0xff) return 'UTF-16BE';
+  if (bytes.length >= 2 && b(0) === 0xff && b(1) === 0xfe) return 'UTF-16LE';
+  var m = /charset\s*=\s*["']?([A-Za-z0-9._:-]+)/i.exec(contentType || '');
+  if (m) return m[1];
+  var head = '';
+  for (var i = 0; i < Math.min(bytes.length, 256); i++) head += b(i) < 128 ? String.fromCharCode(b(i)) : '?';
+  var d = /^\s*<\?xml[^>]*encoding\s*=\s*["']([A-Za-z0-9._:-]+)["']/i.exec(head);
+  return d ? d[1] : '';
+}
+function decodeDigestFeed_(bytes, contentType) {
+  var charset = detectFeedCharset_(bytes, contentType);
   var text = Utilities.newBlob(bytes).getDataAsString(normalizeCharset_(charset || 'UTF-8'));
-  return text.replace(/^﻿/, '').replace(/^\s+/, '').replace(/^<\?xml[^>]*\?>/, '<?xml version="1.0"?>');
+  return text.replace(/^\uFEFF/, '').replace(/^\s+/, '').replace(/^<\?xml[^>]*\?>/, '<?xml version="1.0"?>');
 }
 function normalizeCharset_(cs) {
   var c = String(cs).toLowerCase().replace(/^x-/, '');
@@ -411,7 +484,9 @@ function parseFeedDate_(raw) {
 }
 
 function parseDigestFeed_(xml, source) {
-  var root = XmlService.parse(xml).getRootElement();
+  return parseDigestRoot_(XmlService.parse(xml).getRootElement(), source);
+}
+function parseDigestRoot_(root, source) {
   var children = function (e, name) { return e.getChildren().filter(function (c) { return c.getName() === name; }); };
   // Names are compared without namespaces, so empty elements such as <media:content/>
   // or <atom:link/> share a local name with the real field. Skip empty matches.
@@ -514,7 +589,16 @@ function summarizeDigestArticle_(item, gemini, deadline, pacer) {
         method: 'post', contentType: 'application/json', headers: { 'x-goog-api-key': gemini.apiKey },
         payload: JSON.stringify(body), muteHttpExceptions: true
       });
-    } catch (ignored) { throw publicDigestError_('GEMINI_NETWORK_ERROR'); }
+    } catch (error) {
+      if (isUrlFetchQuotaError_(error)) {
+        // Every later request fails the same way today: defer the rest, send what is done.
+        var quota = urlFetchQuotaError_();
+        quota.digestDeferred = true;
+        quota.digestReason = 'URL取得の1日の上限（URLFETCH_DAILY_QUOTA）に達したため';
+        throw quota;
+      }
+      throw publicDigestError_('GEMINI_NETWORK_ERROR');
+    }
     var code = response.getResponseCode();
     if (code === 429 || code >= 500) {
       var apiWait = geminiRetryInfoMs_(response);

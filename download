@@ -1,0 +1,10 @@
+.env
+.env.*
+!.env.example
+.clasp.json
+node_modules/
+coverage/
+*.log
+credentials*.json
+secrets*.json
+exports/
